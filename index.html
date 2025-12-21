@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Mask Detection</title>
+
+<style>
+html, body {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: black;
+    font-family: Arial, sans-serif;
+}
+
+/* ===== Layout ===== */
+#container {
+    display: flex;
+    width: 100vw;
+    height: 100vh;
+}
+
+#video-area {
+    position: relative;
+    flex: 1;
+    background: black;
+}
+
+#controls {
+    position: absolute;
+    top: 16px;
+    left: 16px;
+    z-index: 10;
+    background: rgba(0, 0, 0, 0.7);
+    padding: 12px 16px;
+    border-radius: 8px;
+}
+
+#mode-selector {
+    display: flex;
+    gap: 16px;
+}
+
+#mode-selector label {
+    color: #eee;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+#mode-selector input[type="radio"] {
+    cursor: pointer;
+}
+
+video {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+/* ===== Sidebar ===== */
+#sidebar {
+    width: 320px;
+    background: #111;
+    color: #eee;
+    padding: 16px;
+    box-sizing: border-box;
+    overflow-y: auto;
+}
+
+#sidebar h2 {
+    margin-top: 0;
+    color: #00e676;
+}
+
+.person {
+    border: 1px solid #333;
+    border-left: 6px solid #666;
+    padding: 10px;
+    margin-bottom: 10px;
+    background: #1a1a1a;
+    font-size: 14px;
+}
+
+.person.mask {
+    border-left-color: #00e676;
+}
+
+.person.nomask {
+    border-left-color: #ff5252;
+}
+
+.person .label {
+    font-weight: bold;
+    margin-bottom: 4px;
+}
+
+.coords {
+    color: #aaa;
+    font-size: 12px;
+}
+</style>
+</head>
+
+<body>
+
+<div id="container">
+
+    <!-- ===== Video + Canvas ===== -->
+    <div id="video-area">
+        <div id="controls">
+            <div id="mode-selector">
+                <label><input type="radio" name="mode" value="camera" checked> Camera</label>
+                <label><input type="radio" name="mode" value="video"> Video File</label>
+            </div>
+            <input type="file" id="video-file" accept="video/*" style="display: none;">
+        </div>
+        <video id="video" autoplay muted playsinline></video>
+        <canvas id="canvas"></canvas>
+    </div>
+
+    <!-- ===== Sidebar ===== -->
+    <div id="sidebar">
+        <h2>Detected People</h2>
+        <div id="summary">Faces: 0</div>
+        <hr>
+        <div id="people-list"></div>
+    </div>
+
+</div>
+
+<script>
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const summaryEl = document.getElementById("summary");
+const listEl = document.getElementById("people-list");
+const modeRadios = document.querySelectorAll('input[name="mode"]');
+const videoFileInput = document.getElementById("video-file");
+
+let lastResult = null;
+let sending = false;
+let currentStream = null;
+let detectionInterval = null;
+let renderAnimationFrame = null;
+let currentMode = "camera";
+
+function stopCurrentMode() {
+    if (detectionInterval) {
+        clearInterval(detectionInterval);
+        detectionInterval = null;
+    }
+    if (renderAnimationFrame !== null) {
+        cancelAnimationFrame(renderAnimationFrame);
+        renderAnimationFrame = null;
+    }
+    if (currentStream) {
+        currentStream.getTracks().forEach(track => track.stop());
+        currentStream = null;
+    }
+    video.srcObject = null;
+    video.src = "";
+    lastResult = null;
+    updateSidebar({ faces: 0, results: [] });
+}
+
+function setupCanvas() {
+    if (video.videoWidth && video.videoHeight) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        
+        const updateCanvasSize = () => {
+            const videoRect = video.getBoundingClientRect();
+            canvas.style.width = videoRect.width + "px";
+            canvas.style.height = videoRect.height + "px";
+        };
+        
+        updateCanvasSize();
+        video.addEventListener("resize", updateCanvasSize);
+    }
+}
+
+function startRenderLoop() {
+    function render() {
+        if (video.readyState >= 2) {
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            if (lastResult) {
+                drawBoxes(lastResult);
+            }
+        }
+        renderAnimationFrame = requestAnimationFrame(render);
+    }
+    render();
+}
+
+function sendFrame() {
+    if (sending) return;
+    if (video.readyState < 2) return;
+    if (!video.videoWidth || !video.videoHeight) return;
+
+    sending = true;
+    canvas.toBlob(async blob => {
+        try {
+            const form = new FormData();
+            form.append("file", blob, "frame.jpg");
+            const res = await fetch("/detect", {
+                method: "POST",
+                body: form
+            });
+            if (res.ok) {
+                lastResult = await res.json();
+                updateSidebar(lastResult);
+            }
+        } catch (e) {
+            console.error(e);
+        }
+        sending = false;
+    }, "image/jpeg", 0.4);
+}
+
+function startDetectionLoop() {
+    if (detectionInterval) clearInterval(detectionInterval);
+    detectionInterval = setInterval(() => {
+        if (currentMode === "camera" || (currentMode === "video" && !video.paused && !video.ended)) {
+            sendFrame();
+        }
+    }, 250);
+}
+
+async function startCameraMode() {
+    stopCurrentMode();
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
+        currentStream = stream;
+        video.srcObject = stream;
+        video.onloadedmetadata = () => {
+            setupCanvas();
+            startRenderLoop();
+            startDetectionLoop();
+        };
+    } catch (e) {
+        console.error("Camera access failed:", e);
+    }
+}
+
+function startVideoMode(file) {
+    stopCurrentMode();
+    const url = URL.createObjectURL(file);
+    video.src = url;
+    video.onloadedmetadata = () => {
+        setupCanvas();
+        startRenderLoop();
+        startDetectionLoop();
+    };
+    video.onended = () => {
+        if (detectionInterval) {
+            clearInterval(detectionInterval);
+            detectionInterval = null;
+        }
+    };
+    video.onplay = () => {
+        if (!detectionInterval) {
+            startDetectionLoop();
+        }
+    };
+    video.onseeked = () => {
+        sendFrame();
+    };
+}
+
+modeRadios.forEach(radio => {
+    radio.addEventListener("change", (e) => {
+        if (e.target.value === "camera") {
+            currentMode = "camera";
+            startCameraMode();
+        } else {
+            currentMode = "video";
+            videoFileInput.click();
+        }
+    });
+});
+
+videoFileInput.addEventListener("change", (e) => {
+    const file = e.target.files[0];
+    if (file) {
+        startVideoMode(file);
+    }
+});
+
+function drawBoxes(data) {
+    ctx.lineWidth = 3;
+    ctx.font = "18px Arial";
+    data.results.forEach(face => {
+        const [x1, y1, x2, y2] = face.box;
+        const text = `${face.label} (${face.confidence}%)`;
+        let color = "yellow";
+        if (face.label === "With Mask") color = "lime";
+        if (face.label === "No Mask") color = "red";
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+        ctx.fillText(text, x1, y1 - 6);
+    });
+}
+
+function updateSidebar(data) {
+    summaryEl.textContent = `Faces: ${data.faces}`;
+    listEl.innerHTML = "";
+    data.results.forEach((face, idx) => {
+        const [x1, y1, x2, y2] = face.box;
+        const div = document.createElement("div");
+        div.className = "person " + (face.label === "With Mask" ? "mask" : "nomask");
+        div.innerHTML = `
+            <div class="label">#${idx + 1} - ${face.label}</div>
+            <div>Confidence: <b>${face.confidence}%</b></div>
+            <div class="coords">
+                Box: (${x1}, ${y1}) → (${x2}, ${y2})
+            </div>
+        `;
+        listEl.appendChild(div);
+    });
+}
+
+startCameraMode();
+</script>
+
+</body>
+</html>
