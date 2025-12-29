@@ -3,3 +3,8 @@
 /pre_train
 /split_data
 data.zip
+/__pycache__
+/another_models
+/media
+/models
+/video
